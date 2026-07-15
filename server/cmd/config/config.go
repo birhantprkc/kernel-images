@@ -52,6 +52,19 @@ type Config struct {
 	S2Basin       string `envconfig:"S2_BASIN"        default:""`
 	S2AccessToken string `envconfig:"S2_ACCESS_TOKEN" default:""`
 	S2Stream      string `envconfig:"S2_STREAM"       default:""`
+
+	// Browser-telemetry OTLP export. OTLPEndpoint (host[:port]) must be set to
+	// enable the OTLP sink. The BTEL_ prefix avoids collision with the standard
+	// OTEL_ vars that configure the API server's own telemetry.
+	OTLPEndpoint    string `envconfig:"BTEL_OTLP_ENDPOINT"     default:""`
+	OTLPPath        string `envconfig:"BTEL_OTLP_PATH"         default:"/v1/logs"`
+	OTLPInsecure    bool   `envconfig:"BTEL_OTLP_INSECURE"     default:"false"`
+	OTLPServiceName string `envconfig:"BTEL_OTLP_SERVICE_NAME" default:"kernel-browser"`
+	// Platform-injected identity, reused to stamp the OTLP Resource. These are
+	// the same envs the VM already receives.
+	InstanceJWT  string `envconfig:"KERNEL_INSTANCE_JWT" default:""`
+	InstanceName string `envconfig:"INST_NAME"           default:""`
+	MetroName    string `envconfig:"METRO_NAME"          default:""`
 }
 
 // LogValue implements slog.LogValuer, redacting secret fields.
@@ -59,6 +72,10 @@ func (c *Config) LogValue() slog.Value {
 	s2AccessToken := ""
 	if c.S2AccessToken != "" {
 		s2AccessToken = "[redacted]"
+	}
+	otlpJWT := ""
+	if c.InstanceJWT != "" {
+		otlpJWT = "[redacted]"
 	}
 	return slog.GroupValue(
 		slog.Int("port", c.Port),
@@ -79,6 +96,13 @@ func (c *Config) LogValue() slog.Value {
 		slog.String("s2_basin", c.S2Basin),
 		slog.String("s2_access_token", s2AccessToken),
 		slog.String("s2_stream", c.S2Stream),
+		slog.String("otlp_endpoint", c.OTLPEndpoint),
+		slog.String("otlp_path", c.OTLPPath),
+		slog.Bool("otlp_insecure", c.OTLPInsecure),
+		slog.String("otlp_instance_jwt", otlpJWT),
+		slog.String("otlp_service_name", c.OTLPServiceName),
+		slog.String("otlp_instance_name", c.InstanceName),
+		slog.String("otlp_metro", c.MetroName),
 	)
 }
 

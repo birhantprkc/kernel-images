@@ -18,6 +18,8 @@ import (
 	"github.com/ghodss/yaml"
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-logr/logr"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 
 	serverpkg "github.com/kernel/kernel-images/server"
@@ -128,6 +130,37 @@ func main() {
 		if err := s2Writer.Start(ctx); err != nil {
 			slogger.Error("failed to start S2 storage writer", "err", err)
 			os.Exit(1)
+		}
+	}
+
+	// Optional OTLP export sink. Independent of S2; both can run together.
+	var otlpWriter *events.OTLPStorageWriter
+	if config.OTLPEndpoint != "" {
+		headers := map[string]string{}
+		if config.InstanceJWT != "" {
+			headers["Authorization"] = "Bearer " + config.InstanceJWT
+		}
+		slogger.Info("OTLP export enabled", "endpoint", config.OTLPEndpoint, "path", config.OTLPPath)
+		otlpWriter = events.NewOTLPStorageWriter(eventStream, events.OTLPConfig{
+			Endpoint:     config.OTLPEndpoint,
+			URLPath:      config.OTLPPath,
+			Insecure:     config.OTLPInsecure,
+			Headers:      headers,
+			ServiceName:  config.OTLPServiceName,
+			InstanceName: config.InstanceName,
+			Metro:        config.MetroName,
+		}, slogger)
+		if err := otlpWriter.Start(ctx); err != nil {
+			// Best-effort sink: a failed exporter must not take down the browser.
+			slogger.Error("OTLP export disabled: storage writer failed to start", "err", err)
+			otlpWriter = nil
+		} else {
+			// Export is running, so route the OTel log SDK's global logger (which
+			// reports batch-queue drops at logr V(1), just below slog Info) to a
+			// handler that admits that level, making drops observable. Only touched
+			// on success, so a failed start leaves the process-wide logger alone.
+			otelDiag := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo - 1})
+			otel.SetLogger(logr.FromSlogHandler(otelDiag))
 		}
 	}
 
@@ -348,6 +381,14 @@ func main() {
 		defer stopCancel()
 		if err := s2Writer.Stop(stopCtx); err != nil {
 			slogger.Error("s2 storage writer stop failed", "err", err)
+		}
+	}
+
+	if otlpWriter != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		if err := otlpWriter.Stop(stopCtx); err != nil {
+			slogger.Error("otlp storage writer stop failed", "err", err)
 		}
 	}
 }
