@@ -11,7 +11,12 @@ import (
 	"github.com/kernel/kernel-images/server/lib/forkidentity"
 )
 
-func forkIdentityHandler(log *slog.Logger) http.HandlerFunc {
+// onApplied runs once the guest has taken the identity, so services this
+// process owns can retarget themselves to it. It is called with the applied
+// payload and only on success; pass nil when there is nothing to retarget.
+// It must not block: the handoff is the control plane's critical path and
+// does not wait on optional sinks.
+func forkIdentityHandler(log *slog.Logger, onApplied func(forkidentity.Payload)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		enabled, err := forkidentity.WaitEnabled()
 		if err != nil {
@@ -57,6 +62,9 @@ func forkIdentityHandler(log *slog.Logger) http.HandlerFunc {
 			log.Error("fork identity apply wait failed", "err", err)
 			http.Error(w, "fork identity not applied", http.StatusInternalServerError)
 			return
+		}
+		if onApplied != nil {
+			onApplied(payload)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}

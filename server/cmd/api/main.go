@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 	"github.com/kernel/kernel-images/server/lib/chromedriverproxy"
 	"github.com/kernel/kernel-images/server/lib/devtoolsproxy"
 	"github.com/kernel/kernel-images/server/lib/events"
+	"github.com/kernel/kernel-images/server/lib/forkidentity"
 	"github.com/kernel/kernel-images/server/lib/logger"
 	"github.com/kernel/kernel-images/server/lib/metrics"
 	"github.com/kernel/kernel-images/server/lib/nekoclient"
@@ -122,14 +125,47 @@ func main() {
 		slogger.Error("sysmon: kmsg OOM monitor disabled", "err", err)
 	}
 
-	// Optional S2 storage sink.
-	var s2Writer *events.S2StorageWriter
-	if config.S2Basin != "" && config.S2AccessToken != "" && config.S2Stream != "" {
-		slogger.Info("S2 storage enabled", "basin", config.S2Basin, "stream", config.S2Stream)
-		s2Writer = events.NewS2StorageWriter(eventStream, config.S2Basin, config.S2AccessToken, config.S2Stream, events.S2Config{}, slogger)
-		if err := s2Writer.Start(ctx); err != nil {
-			slogger.Error("failed to start S2 storage writer", "err", err)
-			os.Exit(1)
+	// Malformed flag: treat as disabled but surface it, matching how the OTLP
+	// identity provider handles the same flag. Exiting would crashloop the VM
+	// over a provisioning typo.
+	forkIdentityWait, err := forkidentity.WaitEnabled()
+	if err != nil {
+		slogger.Warn("fork-identity wait flag invalid; treating as disabled", "err", err)
+	}
+	// An instance that already took a fork identity keeps it across a restart of
+	// this process, which the env captured at boot does not reflect.
+	s2Stream, s2StreamApplied := appliedS2Stream(config)
+
+	// Optional S2 storage sink. The append session is bound to one stream when
+	// it starts, and an instance still holding for a fork identity is carrying
+	// the stream name of the instance it was forked from, so defer the writer
+	// until the identity that owns the events arrives. Opening that session
+	// dials with no deadline while holding the writer's lock, so an in-flight
+	// start is tracked for shutdown rather than blocking Stop behind the dial.
+	var s2Writer atomic.Pointer[events.S2StorageWriter]
+	var s2Starting sync.WaitGroup
+	startS2Writer := func(streamName string) error {
+		if config.S2Basin == "" || config.S2AccessToken == "" || streamName == "" || s2Writer.Load() != nil {
+			return nil
+		}
+		w := events.NewS2StorageWriter(eventStream, config.S2Basin, config.S2AccessToken, streamName, events.S2Config{}, slogger)
+		if !s2Writer.CompareAndSwap(nil, w) {
+			return nil
+		}
+		slogger.Info("S2 storage enabled", "basin", config.S2Basin, "stream", streamName)
+		if err := w.Start(ctx); err != nil {
+			// Leave the slot empty so a later identity can still open a writer.
+			s2Writer.CompareAndSwap(w, nil)
+			return err
+		}
+		return nil
+	}
+	if !forkIdentityWait || s2StreamApplied {
+		// An optional sink that cannot open must not take the browser down: the
+		// api runs under supervisord with autorestart, so exiting here would
+		// crashloop the VM over a misconfigured basin or token.
+		if err := startS2Writer(s2Stream); err != nil {
+			slogger.Error("failed to start S2 storage writer, continuing without it", "err", err)
 		}
 	}
 
@@ -172,6 +208,26 @@ func main() {
 		}, slogger)
 	}
 
+	// A fork boots carrying the stream of the instance it came from, and the S2
+	// writer binds a stream when it starts, so it is opened here once the guest
+	// has taken an identity of its own. OTLP needs no hook here: its credential
+	// resolves per request and its resource attributes at exporter build, and
+	// export is turned on per session, which the platform does after the
+	// handoff. An export started before then keeps the source's resource
+	// attributes until it is restarted.
+	onForkIdentityApplied := func(payload forkidentity.Payload) {
+		// Opening the S2 append session dials the network with no deadline, so
+		// it runs off the handoff's critical path.
+		stream := forkidentity.FirstNonEmpty(forkidentity.Env(payload)["S2_STREAM"], config.S2Stream)
+		s2Starting.Add(1)
+		go func() {
+			defer s2Starting.Done()
+			if err := startS2Writer(stream); err != nil {
+				slogger.Error("failed to start S2 storage writer for fork identity", "err", err)
+			}
+		}()
+	}
+
 	apiService, err := api.New(
 		recorder.NewFFmpegManager(),
 		recorder.NewFFmpegRecorderFactory(config.PathToFFmpeg, defaultParams, stz),
@@ -196,7 +252,7 @@ func main() {
 	oapi.HandlerFromMux(strictHandler, r)
 
 	// Fork identity endpoints - not part of OpenAPI spec.
-	r.Post("/internal/fork-identity", forkIdentityHandler(slogger))
+	r.Post("/internal/fork-identity", forkIdentityHandler(slogger, onForkIdentityApplied))
 	r.Get("/internal/fork-identity/config", forkIdentityConfigHandler(slogger))
 
 	// endpoints to expose the spec
@@ -389,12 +445,25 @@ func main() {
 
 	// s2Writer shuts down after the servers above, since they might produce events we
 	// want to capture into the stream; we must let them finish before closing the writer.
-	if s2Writer != nil {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer stopCancel()
-		if err := s2Writer.Stop(stopCtx); err != nil {
-			slogger.Error("s2 storage writer stop failed", "err", err)
+	// Stop takes the same lock the unbounded append-session dial holds, so only
+	// drain once a start that is still opening has finished. Skipping the drain
+	// loses at most the events of a writer that was never serving.
+	s2StartSettled := make(chan struct{})
+	go func() {
+		s2Starting.Wait()
+		close(s2StartSettled)
+	}()
+	select {
+	case <-s2StartSettled:
+		if w := s2Writer.Load(); w != nil {
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer stopCancel()
+			if err := w.Stop(stopCtx); err != nil {
+				slogger.Error("s2 storage writer stop failed", "err", err)
+			}
 		}
+	case <-time.After(2 * time.Second):
+		slogger.Warn("s2 storage writer still opening at shutdown, skipping drain")
 	}
 
 	// Likewise stop OTLP export after the servers drain (a no-op if the toggle
@@ -414,6 +483,37 @@ func mustFFmpeg() {
 	if err := cmd.Run(); err != nil {
 		panic(fmt.Errorf("ffmpeg not found or not executable: %w", err))
 	}
+}
+
+// appliedS2Stream resolves the stream the S2 writer should bind, preferring a
+// fork identity the guest has already taken over the env this process started
+// with. The env belongs to the instance this one was forked from, and it is what
+// a restarted api would otherwise bind for the rest of the instance's life.
+// Reports whether an applied fork identity supplied it.
+//
+// OTLP resolves its identity per use instead (otlpIdentityProvider), so a stale
+// read there self-corrects; an S2 append session binds once, so this read has to
+// be right the first time.
+func appliedS2Stream(cfg *config.Config) (string, bool) {
+	stream := cfg.S2Stream
+
+	// This process starts before the wrapper enters the wait, and entering it
+	// clears the applied marker and then writes the ready file. So a marker
+	// without a ready file predates this boot's wait: the wrapper is about to
+	// drop it and hold for a new handoff, and binding to it would pin the sinks
+	// to an identity nothing is going to use.
+	if _, err := os.Stat(forkidentity.ReadyFile); err != nil {
+		return stream, false
+	}
+	applied, err := forkidentity.ReadAppliedMarker()
+	if err != nil || applied == "" {
+		return stream, false
+	}
+	payload, err := forkidentity.ReadPayload()
+	if err != nil || payload.InstanceName() != applied {
+		return stream, false
+	}
+	return forkidentity.FirstNonEmpty(forkidentity.Env(payload)["S2_STREAM"], stream), true
 }
 
 // chromeJSONProxyHandler returns a handler that proxies a JSON endpoint from
