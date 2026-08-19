@@ -77,6 +77,9 @@ func (s *ApiService) ChromiumConfigure(ctx context.Context, request oapi.Chromiu
 		return cfg400("no configuration fields provided"), nil
 	}
 
+	s.chromiumConfigMu.Lock()
+	defer s.chromiumConfigMu.Unlock()
+
 	needsStop := chromiumNeedsStopCycle(st)
 	chromiumStopped := false
 	restartAfterStop := func() error {
@@ -711,7 +714,7 @@ func chromiumDisplayApplyWhileStopped(ctx context.Context, s *ApiService, plan *
 }
 
 func chromiumRunPatchDisplay(ctx context.Context, s *ApiService, body *oapi.PatchDisplayJSONRequestBody) oapi.ChromiumConfigureResponseObject {
-	resp, err := s.PatchDisplay(ctx, oapi.PatchDisplayRequestObject{Body: body})
+	resp, err := s.patchDisplayLocked(ctx, oapi.PatchDisplayRequestObject{Body: body})
 	if err != nil {
 		return cfg500ConfigureStep(chromiumConfigureStepDisplay, err.Error())
 	}
@@ -767,7 +770,8 @@ func chromiumApplyExtensions(ctx context.Context, s *ApiService, items []extensi
 	if len(items) == 0 {
 		return "", nil
 	}
-	return s.applyExtensionZipItems(ctx, items)
+	_, reqMsg, err := s.applyExtensionZipItems(ctx, items)
+	return reqMsg, err
 }
 
 func chromiumValidateFlags(raw *string) (*chromiumFlagsPlan, error) {
