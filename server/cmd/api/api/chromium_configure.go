@@ -158,6 +158,11 @@ func (s *ApiService) ChromiumConfigure(ctx context.Context, request oapi.Chromiu
 			if err != nil {
 				return cfg500ConfigureStep(chromiumConfigureStepProfile, err.Error()), nil
 			}
+			if spec.needsNav {
+				if err := stripProfileSessionRestore(preparedProfile); err != nil {
+					return cfg500ConfigureStep(chromiumConfigureStepProfile, err.Error()), nil
+				}
+			}
 			if err := chromiumInstallPreparedProfile(preparedProfile); err != nil {
 				return cfg500ConfigureStep(chromiumConfigureStepProfile, err.Error()), nil
 			}
@@ -562,6 +567,16 @@ func chromiumPrepareProfileArchive(profilePath string, strip int) (preparedDir s
 		return "", nil, fmt.Errorf("chown user-data: %w (%s)", err, string(out))
 	}
 	return preparedDir, cleanup, nil
+}
+
+// stripProfileSessionRestore deletes the prepared profile's Default/Sessions so
+// Chrome cannot restore its saved tabs after the restart and race the start_url
+// navigation. Only the live copy is touched; the stored archive is unchanged.
+func stripProfileSessionRestore(preparedDir string) error {
+	if err := os.RemoveAll(filepath.Join(preparedDir, "Default", "Sessions")); err != nil {
+		return fmt.Errorf("strip profile session restore: %w", err)
+	}
+	return nil
 }
 
 func chromiumInstallPreparedProfile(preparedDir string) error {
