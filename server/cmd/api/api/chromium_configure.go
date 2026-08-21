@@ -53,6 +53,11 @@ func (st *chromiumConfigureState) cleanup() {
 func (s *ApiService) ChromiumConfigure(ctx context.Context, request oapi.ChromiumConfigureRequestObject) (oapi.ChromiumConfigureResponseObject, error) {
 	start := time.Now()
 
+	extensionLoadStrategy, strategyErr := chromiumConfigureExtensionLoadStrategy(request.Params)
+	if strategyErr != "" {
+		return cfg400(strategyErr), nil
+	}
+
 	if request.Body == nil {
 		return cfg400("request body required"), nil
 	}
@@ -77,15 +82,36 @@ func (s *ApiService) ChromiumConfigure(ctx context.Context, request oapi.Chromiu
 		return cfg400("no configuration fields provided"), nil
 	}
 
+	mode := chromiumConfigureModeFor(st, extensionLoadStrategy)
+	var preparedExtensions *preparedExtensionBatch
+	if mode == chromiumConfigureModePreferCDPExtensions {
+		var reqMsg string
+		var err error
+		preparedExtensions, reqMsg, err = s.prepareExtensionZipItems(ctx, st.extItems)
+		if preparedExtensions != nil {
+			defer preparedExtensions.cleanup()
+		}
+		if reqMsg != "" {
+			return cfg400(fmt.Sprintf("%s: %s", chromiumConfigureStepExtensions, reqMsg)), nil
+		}
+		if err != nil {
+			return cfg500ConfigureStep(chromiumConfigureStepExtensions, err.Error()), nil
+		}
+	}
+
 	s.chromiumConfigMu.Lock()
 	defer s.chromiumConfigMu.Unlock()
 
 	var configureResp oapi.ChromiumConfigureResponseObject
-	switch chromiumConfigureModeFor(st) {
+	switch mode {
 	case chromiumConfigureModeLive:
 		configureResp = s.chromiumConfigureLive(ctx, st, spec)
 	case chromiumConfigureModeRestart:
-		configureResp = s.chromiumConfigureRestart(ctx, st, spec)
+		configureResp = s.chromiumConfigureRestart(ctx, st, spec, func() (string, error) {
+			return s.installExtensionZipItems(ctx, st.extItems)
+		}, nil)
+	case chromiumConfigureModePreferCDPExtensions:
+		configureResp = s.chromiumConfigurePreferCDPExtensions(ctx, st, spec, preparedExtensions)
 	default:
 		return cfg500Configure("unhandled configure mode"), nil
 	}
@@ -102,13 +128,29 @@ type chromiumConfigureMode uint8
 const (
 	chromiumConfigureModeLive chromiumConfigureMode = iota
 	chromiumConfigureModeRestart
+	chromiumConfigureModePreferCDPExtensions
 )
 
-func chromiumConfigureModeFor(st *chromiumConfigureState) chromiumConfigureMode {
+func chromiumConfigureExtensionLoadStrategy(params oapi.ChromiumConfigureParams) (oapi.ChromiumConfigureParamsExtensionLoadStrategy, string) {
+	if params.ExtensionLoadStrategy == nil {
+		return oapi.Restart, ""
+	}
+	if !params.ExtensionLoadStrategy.Valid() {
+		return "", "extension_load_strategy must be restart or prefer_cdp"
+	}
+	return *params.ExtensionLoadStrategy, ""
+}
+
+func chromiumConfigureModeFor(st *chromiumConfigureState, strategy oapi.ChromiumConfigureParamsExtensionLoadStrategy) chromiumConfigureMode {
 	if st.hasProfile ||
-		len(st.extItems) > 0 ||
 		policiesContentNonEmpty(st.chromePoliciesJSON) ||
 		flagsContentNonEmpty(st.chromiumFlagsJSON) {
+		return chromiumConfigureModeRestart
+	}
+	if len(st.extItems) > 0 {
+		if strategy == oapi.PreferCdp {
+			return chromiumConfigureModePreferCDPExtensions
+		}
 		return chromiumConfigureModeRestart
 	}
 	return chromiumConfigureModeLive
@@ -140,7 +182,50 @@ func chromiumConfigureNavigate(ctx context.Context, s *ApiService, spec startURL
 	}
 }
 
-func (s *ApiService) chromiumConfigureRestart(ctx context.Context, st *chromiumConfigureState, spec startURLParsed) (resp oapi.ChromiumConfigureResponseObject) {
+func (s *ApiService) chromiumConfigurePreferCDPExtensions(ctx context.Context, st *chromiumConfigureState, spec startURLParsed, prepared *preparedExtensionBatch) oapi.ChromiumConfigureResponseObject {
+	commitExtensions := func() (string, error) {
+		_, reqMsg, err := s.commitPreparedExtensions(ctx, prepared)
+		return reqMsg, err
+	}
+	if prepared.requiresRestart {
+		return s.chromiumConfigureRestart(ctx, st, spec, commitExtensions, func() oapi.ChromiumConfigureResponseObject {
+			if err := s.verifyUnpackedExtensions(ctx, prepared.extensions); err != nil {
+				return cfg500ConfigureStep(chromiumConfigureStepExtensions, err.Error())
+			}
+			return nil
+		})
+	}
+
+	// Configure keeps the default restart path's non-transactional install semantics.
+	// Rolling back after fallback verification would require a second restart.
+	reqMsg, err := commitExtensions()
+	if reqMsg != "" {
+		return cfg400(fmt.Sprintf("%s: %s", chromiumConfigureStepExtensions, reqMsg))
+	}
+	if err != nil {
+		return cfg500ConfigureStep(chromiumConfigureStepExtensions, err.Error())
+	}
+
+	loadErr := s.loadUnpackedExtensions(ctx, prepared.extensions)
+	if loadErr == nil {
+		return s.chromiumConfigureLive(ctx, st, spec)
+	}
+	logger.FromContext(ctx).Warn("CDP extension load failed during configure, restarting Chromium", "error", loadErr)
+
+	// Extensions are already persisted. The fallback re-launches Chromium with
+	// the merged flags and still applies any pending display change.
+	return s.chromiumConfigureRestart(ctx, st, spec, nil, func() oapi.ChromiumConfigureResponseObject {
+		if err := s.verifyUnpackedExtensions(ctx, prepared.extensions); err != nil {
+			return cfg500ConfigureStep(chromiumConfigureStepExtensions, errors.Join(loadErr, err).Error())
+		}
+		return nil
+	})
+}
+
+type chromiumConfigureExtensionInstaller func() (string, error)
+type chromiumConfigurePostRestartCheck func() oapi.ChromiumConfigureResponseObject
+
+func (s *ApiService) chromiumConfigureRestart(ctx context.Context, st *chromiumConfigureState, spec startURLParsed, installExtensions chromiumConfigureExtensionInstaller, postRestartCheck chromiumConfigurePostRestartCheck) (resp oapi.ChromiumConfigureResponseObject) {
 	var stoppedRecordings []stoppedRecordingInfo
 	chromiumStopped := false
 	restartAfterStop := func() error {
@@ -183,10 +268,14 @@ func (s *ApiService) chromiumConfigureRestart(ctx context.Context, st *chromiumC
 		return cfgResponseFromStepError(chromiumConfigureStepPolicies, err)
 	}
 
-	if reqMsgs, ierr := chromiumApplyExtensions(ctx, s, st.extItems); reqMsgs != "" {
-		return cfg400(fmt.Sprintf("%s: %s", chromiumConfigureStepExtensions, reqMsgs))
-	} else if ierr != nil {
-		return cfg500ConfigureStep(chromiumConfigureStepExtensions, ierr.Error())
+	if installExtensions != nil {
+		extensionReqMsg, extensionErr := installExtensions()
+		if extensionReqMsg != "" {
+			return cfg400(fmt.Sprintf("%s: %s", chromiumConfigureStepExtensions, extensionReqMsg))
+		}
+		if extensionErr != nil {
+			return cfg500ConfigureStep(chromiumConfigureStepExtensions, extensionErr.Error())
+		}
 	}
 
 	if st.displayJSON != nil && strings.TrimSpace(*st.displayJSON) != "" {
@@ -234,6 +323,11 @@ func (s *ApiService) chromiumConfigureRestart(ctx context.Context, st *chromiumC
 
 	if err := restartAfterStop(); err != nil {
 		return cfg500ConfigureStep(chromiumConfigureStepStart, err.Error())
+	}
+	if postRestartCheck != nil {
+		if resp := postRestartCheck(); resp != nil {
+			return resp
+		}
 	}
 	chromiumConfigureNavigate(ctx, s, spec)
 	if len(stoppedRecordings) > 0 {
@@ -802,14 +896,6 @@ func chromiumApplyPolicies(ctx context.Context, s *ApiService, overrides policy.
 		return err
 	}
 	return nil
-}
-
-func chromiumApplyExtensions(ctx context.Context, s *ApiService, items []extensionZipItem) (string, error) {
-	if len(items) == 0 {
-		return "", nil
-	}
-	_, reqMsg, err := s.applyExtensionZipItems(ctx, items)
-	return reqMsg, err
 }
 
 func chromiumValidateFlags(raw *string) (*chromiumFlagsPlan, error) {
