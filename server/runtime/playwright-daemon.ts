@@ -12,7 +12,7 @@
 import { createServer, Socket } from 'net';
 import { unlinkSync, existsSync } from 'fs';
 import { transform } from 'esbuild';
-import { chromium as chromiumPW, Browser, BrowserContext, Page } from 'playwright-core';
+import { chromium as chromiumPW, Browser, Page } from 'playwright-core';
 import { chromium as chromiumPR } from 'patchright';
 
 const SOCKET_PATH = process.env.PLAYWRIGHT_DAEMON_SOCKET || '/tmp/playwright-daemon.sock';
@@ -131,13 +131,7 @@ async function ensureBrowserConnection(): Promise<Browser> {
   }
 }
 
-// Resolves the browser's actual foreground tab via CDP rather than guessing from
-// tab-creation order. Chrome 150+ populates `TargetInfo.embedderData.tabActive`
-// on `tab` targets from the real tab strip state; the Playwright `Page` for that
-// tab is found by relating the tab target to its page target with
-// `Target.autoAttachRelated`. Every session used here is temporary and detached
-// before returning, so this adds no cross-request state to the daemon.
-async function resolveActivePage(browser: Browser, context: BrowserContext): Promise<Page> {
+async function activeTabTargetIds(browser: Browser): Promise<string[]> {
   const root = await browser.newBrowserCDPSession();
 
   try {
@@ -145,9 +139,18 @@ async function resolveActivePage(browser: Browser, context: BrowserContext): Pro
       filter: [{ type: 'tab', exclude: false }, { exclude: true }],
     });
 
-    const activeTab = targetInfos.find(target => (target.embedderData as any)?.tabActive === true);
-    if (!activeTab) throw new Error('no foreground tab reported by CDP');
+    return targetInfos
+      .filter(target => (target.embedderData as any)?.tabActive === true)
+      .map(target => target.targetId);
+  } finally {
+    await root.detach().catch(() => {});
+  }
+}
 
+async function pageForTabTarget(browser: Browser, targetId: string, pages: Page[]): Promise<Page | null> {
+  const root = await browser.newBrowserCDPSession();
+
+  try {
     const relatedPageIds = new Set<string>();
     root.on('Target.attachedToTarget', event => {
       if (event.targetInfo.type === 'page' && !event.targetInfo.subtype) {
@@ -156,13 +159,14 @@ async function resolveActivePage(browser: Browser, context: BrowserContext): Pro
     });
 
     await root.send('Target.autoAttachRelated', {
-      targetId: activeTab.targetId,
+      targetId,
       waitForDebuggerOnStart: false,
       filter: [{ type: 'page', exclude: false }, { exclude: true }],
     });
 
-    for (const page of context.pages()) {
+    for (const page of pages) {
       try {
+        const context = page.context();
         const session = await context.newCDPSession(page);
         try {
           const { targetInfo } = await session.send('Target.getTargetInfo');
@@ -177,10 +181,64 @@ async function resolveActivePage(browser: Browser, context: BrowserContext): Pro
       }
     }
 
-    throw new Error('foreground tab has no matching Playwright page');
+    return null;
   } finally {
     await root.detach().catch(() => {});
   }
+}
+
+// Chrome reports one active tab per window. Try every reported target against
+// every Playwright context's pages.
+//
+// A pass can legitimately find an active tab with no matching page. The known
+// cause is a cross-origin navigation in a freshly opened tab (e.g. a site
+// handing the user off to a sibling product on another origin): Chrome swaps
+// the tab's page target to a new renderer process and marks the tab active
+// before Playwright has attached to the replacement target. That gap is
+// transient but has been observed to outlast back-to-back daemon calls, so an
+// immediate retry lands inside the same gap; the retries are spaced to give
+// Playwright time to attach. The delay is only paid when a pass fails, and
+// callers fall back to an open page if every attempt misses.
+const ACTIVE_PAGE_RESOLUTION_ATTEMPTS = 3;
+const ACTIVE_PAGE_RESOLUTION_RETRY_DELAY_MS = 150;
+
+async function resolveActivePage(browser: Browser): Promise<Page | null> {
+  let activeTabIds: string[] = [];
+
+  for (let attempt = 0; attempt < ACTIVE_PAGE_RESOLUTION_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await new Promise(resolve => setTimeout(resolve, ACTIVE_PAGE_RESOLUTION_RETRY_DELAY_MS));
+    }
+
+    try {
+      const pages = browser
+        .contexts()
+        .flatMap(context => context.pages())
+        .filter(page => !page.isClosed());
+
+      activeTabIds = await activeTabTargetIds(browser);
+      for (const targetId of activeTabIds) {
+        try {
+          const page = await pageForTabTarget(browser, targetId, pages);
+          if (page) return page;
+        } catch {
+          // This tab may have changed while it was inspected. Keep trying the
+          // other active tabs reported by the same browser snapshot.
+        }
+      }
+
+      // No active tab matched this page snapshot. Retry with fresh snapshots.
+    } catch {
+      // The browser-wide lookup raced with a target change. Discard this pass;
+      // the next attempt, if any, snapshots both pages and active tabs again.
+    }
+  }
+
+  console.error(
+    `[playwright-daemon] active-tab resolution failed after ${ACTIVE_PAGE_RESOLUTION_ATTEMPTS} attempts; ` +
+      `falling back (unmatched active tabs: ${activeTabIds.join(', ') || 'none reported'})`,
+  );
+  return null;
 }
 
 async function executeCode(request: ExecuteRequest, signal: AbortSignal): Promise<ExecuteResponse> {
@@ -222,13 +280,17 @@ async function executeCode(request: ExecuteRequest, signal: AbortSignal): Promis
       }
     }
     const contexts = browserInstance.contexts();
-    const context = contexts.length > 0 ? contexts[0] : await browserInstance.newContext();
-    const pages = context.pages();
+    const defaultContext = contexts.length > 0 ? contexts[0] : await browserInstance.newContext();
+    const pages = contexts.flatMap(context => context.pages());
     // Bind `page` to the actual foreground tab (see resolveActivePage). Using
     // pages[0] bound `page` to the oldest tab regardless of which was active, so
     // calls like page.pdf() operated on the wrong tab whenever more than one was
     // open.
-    const page = pages.length > 0 ? await resolveActivePage(browserInstance, context) : await context.newPage();
+    const page =
+      (pages.length > 0 ? await resolveActivePage(browserInstance) : null) ??
+      pages.findLast(candidate => !candidate.isClosed()) ??
+      (await defaultContext.newPage());
+    const context = page.context();
 
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     const userFunction = new AsyncFunction('page', 'context', 'browser', jsCode);
