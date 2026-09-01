@@ -250,8 +250,12 @@ func main() {
 
 	// api_call event emission. Off until the telemetry handlers flip it on.
 	r.Use(api.TelemetryHTTPMiddleware(telemetrySession.Publish))
-	strictHandler := oapi.NewStrictHandler(apiService, []oapi.StrictMiddlewareFunc{
+	r.Use(api.WebMCPRequestSizeMiddleware)
+	strictHandler := oapi.NewStrictHandlerWithOptions(apiService, []oapi.StrictMiddlewareFunc{
 		api.TelemetryStrictMiddleware(),
+	}, oapi.StrictHTTPServerOptions{
+		RequestErrorHandlerFunc:  api.StrictRequestErrorHandler,
+		ResponseErrorHandlerFunc: api.StrictResponseErrorHandler,
 	})
 	oapi.HandlerFromMux(strictHandler, r)
 

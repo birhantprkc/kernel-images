@@ -80,6 +80,64 @@ func TestPlaywrightExecuteAPI(t *testing.T) {
 
 	t.Log("playwright execute API test passed")
 
+	t.Log("verifying WebMCP helpers in the Playwright execution scope")
+	webmcpRsp, err := client.ExecutePlaywrightCodeWithResponse(ctx, instanceoapi.ExecutePlaywrightCodeJSONRequestBody{
+		Code: `
+			const tools = await webmcp.listTools();
+			let failure;
+			try {
+				await webmcp.invokeTool('wmcp_missing', {});
+			} catch (error) {
+				failure = {
+					name: error.name,
+					statusCode: error.statusCode,
+					code: error.code ?? null,
+					invocationId: error.invocationId ?? null,
+					message: error.body?.message,
+				};
+			}
+			return { frozen: Object.isFrozen(webmcp), tools, failure };
+		`,
+	})
+	require.NoError(t, err, "WebMCP helper request error: %v", err)
+	require.Equal(t, http.StatusOK, webmcpRsp.StatusCode(), "unexpected status: %s body=%s", webmcpRsp.Status(), string(webmcpRsp.Body))
+	require.NotNil(t, webmcpRsp.JSON200)
+	require.True(t, webmcpRsp.JSON200.Success, "expected WebMCP helper execution to succeed")
+	helperResultBytes, err := json.Marshal(webmcpRsp.JSON200.Result)
+	require.NoError(t, err)
+	var helperResult struct {
+		Frozen  bool  `json:"frozen"`
+		Tools   []any `json:"tools"`
+		Failure struct {
+			Name         string  `json:"name"`
+			StatusCode   int     `json:"statusCode"`
+			Code         *string `json:"code"`
+			InvocationID *string `json:"invocationId"`
+			Message      string  `json:"message"`
+		} `json:"failure"`
+	}
+	require.NoError(t, json.Unmarshal(helperResultBytes, &helperResult))
+	require.True(t, helperResult.Frozen)
+	require.NotNil(t, helperResult.Tools)
+	require.Equal(t, "WebMCPRequestError", helperResult.Failure.Name)
+	require.Equal(t, http.StatusNotFound, helperResult.Failure.StatusCode)
+	require.Nil(t, helperResult.Failure.Code)
+	require.Nil(t, helperResult.Failure.InvocationID)
+	require.NotEmpty(t, helperResult.Failure.Message)
+
+	t.Log("verifying existing code may declare its own webmcp binding")
+	shadowedWebMCPRsp, err := client.ExecutePlaywrightCodeWithResponse(ctx, instanceoapi.ExecutePlaywrightCodeJSONRequestBody{
+		Code: `
+			const webmcp = 'user-defined';
+			return webmcp;
+		`,
+	})
+	require.NoError(t, err, "shadowed WebMCP request error: %v", err)
+	require.Equal(t, http.StatusOK, shadowedWebMCPRsp.StatusCode(), "unexpected status: %s body=%s", shadowedWebMCPRsp.Status(), string(shadowedWebMCPRsp.Body))
+	require.NotNil(t, shadowedWebMCPRsp.JSON200)
+	require.True(t, shadowedWebMCPRsp.JSON200.Success, "existing webmcp binding should remain valid")
+	require.Equal(t, "user-defined", shadowedWebMCPRsp.JSON200.Result)
+
 	// Reuse the same container/warm daemon connection to verify tab-binding
 	// behavior: `page` must bind to the browser's actual foreground tab, not
 	// just the most recently opened one (resolveActivePage in
