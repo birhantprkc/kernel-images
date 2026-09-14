@@ -27,6 +27,8 @@ type cdpMonitorController interface {
 	Start(ctx context.Context) error
 	Stop()
 	IsRunning() bool
+	SetTelemetry(bool) error
+	NetworkSnapshot() cdpmonitor.NetworkSnapshot
 }
 
 var _ cdpMonitorController = (*cdpmonitor.Monitor)(nil)
@@ -154,6 +156,7 @@ func New(
 
 	screenshotEnabled := func() bool { return telemetrySession.CategoryEnabled(events.Screenshot) }
 	mon := cdpmonitor.New(upstreamMgr, telemetrySession.Publish, displayNum, slog.Default(), screenshotEnabled)
+	_ = mon.SetTelemetry(false)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &ApiService{
@@ -433,12 +436,24 @@ func (s *ApiService) ListRecorders(ctx context.Context, _ oapi.ListRecordersRequ
 	return oapi.ListRecorders200JSONResponse(infos), nil
 }
 
+// StartNetworkMonitor starts process-lifetime capture, independently of customer telemetry.
+func (s *ApiService) StartNetworkMonitor() error {
+	s.monitorMu.Lock()
+	defer s.monitorMu.Unlock()
+	return s.cdpMonitor.Start(s.lifecycleCtx)
+}
+
+func (s *ApiService) NetworkMetrics() (resets, completed uint64, up bool) {
+	snapshot := s.cdpMonitor.NetworkSnapshot()
+	return snapshot.Resets, snapshot.Completed, snapshot.Up
+}
+
 func (s *ApiService) Shutdown(ctx context.Context) error {
+	s.lifecycleCancel()
 	replErr := s.browserRepl.Shutdown(ctx)
 
 	_ = s.webmcp.Close()
 	s.monitorMu.Lock()
-	s.lifecycleCancel()
 	s.cdpMonitor.Stop()
 	s.telemetrySession.Stop()
 	s.monitorMu.Unlock()
