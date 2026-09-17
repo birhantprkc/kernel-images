@@ -251,6 +251,7 @@ func TestNetworkEvents(t *testing.T) {
 		var data map[string]any
 		require.NoError(t, json.Unmarshal(ev.Data, &data))
 		assert.Equal(t, "provider_blacklisted", data["code"])
+		assert.NotContains(t, data, "raw_code")
 		assert.Equal(t, float64(502), data["status"])
 		assert.Equal(t, "GET", data["method"])
 		assert.Equal(t, "https://blocked.example.com/", data["url"])
@@ -321,47 +322,63 @@ func TestNetworkEvents(t *testing.T) {
 		assert.Equal(t, 1, count, "non-502 response must not emit proxy_error")
 	})
 
-	t.Run("proxy_error_unknown_code_dropped", func(t *testing.T) {
-		cp := ec.checkpoint()
-		// A 502 with a code outside the published enum must be dropped; the
-		// following valid-code 502 is the positive anchor.
-		srv.sendToMonitor(t, map[string]any{
-			"method": "Network.responseReceived",
-			"params": map[string]any{
-				"requestId": "req-unknown",
-				"response": map[string]any{
-					"status": 502, "statusText": "Bad Gateway",
-					"headers":  map[string]any{"X-Kernel-Proxy-Error": "made_up_code"},
-					"mimeType": "text/html",
-				},
-			},
-		})
-		srv.sendToMonitor(t, map[string]any{
-			"method": "Network.responseReceived",
-			"params": map[string]any{
-				"requestId": "req-valid",
-				"response": map[string]any{
-					"status": 502, "statusText": "Bad Gateway",
-					"headers":  map[string]any{"X-Kernel-Proxy-Error": "destination_blocked"},
-					"mimeType": "text/html",
-				},
-			},
-		})
-		ec.waitForNew(t, "proxy_error", cp, 2*time.Second)
-		ec.mu.Lock()
-		defer ec.mu.Unlock()
-		count := 0
-		for _, ev := range ec.events[cp:] {
-			if ev.Type == EventProxyError {
-				count++
-			}
+	t.Run("proxy_error_unknown_code_reported_as_unknown", func(t *testing.T) {
+		tests := []struct {
+			name, header, rawCode, resourceType string
+		}{
+			{name: "unrecognized value", header: "Made-Up Code", rawCode: "made_up_code", resourceType: "Script"},
+			{name: "sentinel text", header: "unknown", rawCode: "unknown", resourceType: "Image"},
+			{name: "empty value", header: "", rawCode: "", resourceType: "Font"},
+			{name: "combined duplicate values", header: "future_one\nfuture_two", rawCode: "future_one_future_two", resourceType: "Media"},
 		}
-		assert.Equal(t, 1, count, "unknown-code response must not emit proxy_error")
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cp := ec.checkpoint()
+				srv.sendToMonitor(t, map[string]any{
+					"method": "Network.responseReceived",
+					"params": map[string]any{
+						"requestId": "req-unknown-" + tt.resourceType,
+						"type":      tt.resourceType,
+						"response": map[string]any{
+							"status": 502, "statusText": "Bad Gateway",
+							"headers":  map[string]any{"X-Kernel-Proxy-Error": tt.header},
+							"mimeType": "text/html",
+						},
+					},
+				})
+				ev := ec.waitForNew(t, "proxy_error", cp, 2*time.Second)
+				var data map[string]any
+				require.NoError(t, json.Unmarshal(ev.Data, &data))
+				assert.Equal(t, "unknown", data["code"])
+				assert.Equal(t, tt.rawCode, data["raw_code"])
+			})
+		}
 	})
 }
 
-// TestProxyErrorRateLimit exercises the proxy_error limiter (enum validation +
-// per-session+code min interval) deterministically, without timing sleeps.
+func TestProxyErrorUnknownCodesShareRateLimit(t *testing.T) {
+	collector := newEventCollector()
+	monitor := New(newTestUpstream(""), collector.publishFn(), 0, discardLogger, nil)
+	monitor.publishProxyError("sess", "req-a", "future_a", 502, 0, "GET", "Document", nil, nil, nil)
+	monitor.publishProxyError("sess", "req-b", "future_b", 502, 0, "GET", "Document", nil, nil, nil)
+
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	var proxyErrors []events.Event
+	for _, event := range collector.events {
+		if event.Type == EventProxyError {
+			proxyErrors = append(proxyErrors, event)
+		}
+	}
+	require.Equal(t, 1, len(proxyErrors))
+	var data map[string]any
+	require.NoError(t, json.Unmarshal(proxyErrors[0].Data, &data))
+	assert.Equal(t, "unknown", data["code"])
+	assert.Equal(t, "future_a", data["raw_code"])
+}
+
+// TestProxyErrorRateLimit exercises the per-session+code limiter
+// deterministically, without timing sleeps.
 func TestProxyErrorRateLimit(t *testing.T) {
 	m := &Monitor{proxyLastEmit: make(map[string]time.Time), log: discardLogger}
 	const interval = proxyErrorMinInterval
@@ -382,15 +399,10 @@ func TestProxyErrorRateLimit(t *testing.T) {
 	m.proxyRateMu.Unlock()
 	require.False(t, m.proxyErrorRateLimited("sess", "provider_blacklisted", "Document"), "after interval must be allowed")
 
-	// Codes outside the published enum are always dropped and never consume a
-	// rate-limit slot, so the map cannot grow with arbitrary header text.
-	require.True(t, m.proxyErrorRateLimited("sess", "made_up_code", "Document"), "unknown code must be dropped")
-	require.True(t, m.proxyErrorRateLimited("sess", "made_up_code", "Document"), "unknown code must be dropped again (no slot stamped)")
-	m.proxyRateMu.Lock()
-	defer m.proxyRateMu.Unlock()
-	for k := range m.proxyLastEmit {
-		assert.NotContains(t, k, "made_up_code", "unknown code must not occupy a map key")
-	}
+	// Header values outside the enum are published as unknown, so they share one
+	// slot per session+resource_type and cannot grow the map with header text.
+	require.False(t, m.proxyErrorRateLimited("sess", proxyErrorUnknownCode, "Document"))
+	require.True(t, m.proxyErrorRateLimited("sess", proxyErrorUnknownCode, "Document"), "unknown codes share a single slot within the interval")
 }
 
 func TestProxyErrorClassifiers(t *testing.T) {
