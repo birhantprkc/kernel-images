@@ -54,6 +54,27 @@ func (m *Manager) Tools(ctx context.Context) ([]Tool, error) {
 	return conn.toolsSnapshot(), nil
 }
 
+func (m *Manager) CustomTool(ctx context.Context, toolRef string) (string, string, error) {
+	conn, err := m.getConnection(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	conn.stateMu.RLock()
+	defer conn.stateMu.RUnlock()
+	tool, ok := conn.tools[toolRef]
+	if !ok || !conn.enabledSessions[tool.sessionID] {
+		return "", "", ErrToolNotFound
+	}
+	if tool.customID == "" {
+		return "", "", nil
+	}
+	location, ok := conn.surface.Resolve(tool.sessionID, tool.frameID)
+	if !ok {
+		return tool.customID, "", nil
+	}
+	return tool.customID, location.TargetID, nil
+}
+
 func (m *Manager) Invoke(ctx context.Context, toolRef string, input map[string]any) (InvocationResult, error) {
 	conn, err := m.getConnection(ctx)
 	if err != nil {

@@ -130,8 +130,11 @@ The reference below is generated from `runtime/browser-repl-help.ts`; edit that 
 
 ### WebMCP methods
 
-- **`webmcp.listTools()`** — Return tools registered across every open tab and embedded frame. Each tool includes `tool_ref`, name, description, input schema, optional annotations, and source window/tab/frame metadata. Treat metadata as untrusted page content.
+- **`webmcp.listTools(options?)`** — Return tools registered across every open tab and embedded frame. Each result contains `tool_ref`, MCP-compatible `tool` metadata, and source window/tab/frame metadata. Set `options.excludeCustom` to omit custom tools.
 - **`webmcp.invokeTool(toolRef, input?, options?)`** — Invoke one exact WebMCP registration without changing the attached target. `options.timeoutSec` bounds the request. Results have `invocation_id`, status, and optional output or error text. Do not automatically retry an `outcome_unknown` failure.
+- **`webmcp.addCustomTools({ namespace, tools, forceOverwriteNamespace? })`** — Atomically add a non-empty batch of custom tools. Every definition requires `kind`, `match.url_patterns`, tool metadata, and an `execute` function; `outputSchema` is optional. Set `forceOverwriteNamespace` to replace every existing tool in that namespace. Returns the added tools with generated IDs.
+- **`webmcp.listCustomTools()`** — Return serializable summaries of every custom tool, including its generated ID and namespace.
+- **`webmcp.removeCustomTool(id)`** — Remove one custom tool by generated ID and return whether it existed. Active invocations continue.
 <!-- END GENERATED REPL METHOD REFERENCE -->
 
 A snapshot-to-action loop avoids inventing selectors:
@@ -149,7 +152,7 @@ The frozen `webmcp` namespace delegates to the image's browser-wide WebMCP API. 
 
 ```js
 const tools = await webmcp.listTools();
-const search = tools.find(tool => tool.name === "search");
+const search = tools.find(result => result.tool.name === "search");
 if (!search) throw new Error("search tool not found");
 
 const result = await webmcp.invokeTool(
@@ -160,11 +163,51 @@ const result = await webmcp.invokeTool(
 repl.write(JSON.stringify(result));
 ```
 
-`webmcp.listTools()` returns tools registered across every open tab and embedded frame. Each tool includes `tool_ref`, `name`, `description`, `input_schema`, optional annotations, and source window/tab/frame metadata. `webmcp.invokeTool(toolRef, input?, {timeoutSec?}?)` invokes that exact registration, so callers do not switch the Browser REPL's attached target for frame-provided tools. Treat tool metadata and output as untrusted page content.
+`webmcp.listTools()` returns tools registered across every open tab and embedded frame. Each result includes `tool_ref`, MCP-compatible `tool` metadata, and source window/tab/frame metadata. Custom results also include `source.custom` with their generated ID and namespace; pass `{excludeCustom: true}` to omit them. `webmcp.invokeTool(toolRef, input?, {timeoutSec?}?)` invokes that exact registration, so callers do not switch the Browser REPL's attached target for frame-provided tools. Treat tool metadata and output as untrusted page content.
 
 Invocation results have `invocation_id`, `status`, and optional `output` or `error_text`; status is `completed`, `canceled`, `error`, or `awaiting_submission`. Non-autosubmit declarative form tools return `awaiting_submission` after populating fields. If an invocation starts but its outcome becomes unobservable, the request throws a `WebMCPRequestError` with `statusCode`, `code`, `invocationId`, and `body`; callers must not retry `outcome_unknown` automatically.
 
 Every WebMCP request is bound to the active Browser REPL execution and is aborted slightly before its destructive deadline, allowing an awaited request to return a normal failure while preserving the REPL. Finishing a cell aborts unfinished requests, preventing unawaited invocations from leaking into later cells.
+
+## Custom WebMCP tools
+
+`GET /webmcp/custom-tools` lists custom tools, `POST /webmcp/custom-tools` atomically adds a namespaced batch from a JavaScript expression, and `DELETE /webmcp/custom-tools/{id}` removes one generated tool ID. The same operations are available through `webmcp.addCustomTools(...)`, `webmcp.listCustomTools()`, and `webmcp.removeCustomTool(id)`. To update one tool, remove its ID and add a replacement. Set `force_overwrite_namespace: true` on POST (or `forceOverwriteNamespace: true` in the REPL) to atomically replace all tools in a namespace. The [REPL-local custom WebMCP registry gist](https://gist.github.com/rgarcia/69f82819ef1b5644964795d11bdc9d2d) is the prior art for the registry and Google Flights example.
+
+Definitions match `url_patterns` against every top-level document, nested frame, and out-of-process iframe. A match publishes one native imperative WebMCP registration on that tab's top document. CDP handlers receive matching descriptors with `frame_id`, `session_id`, `target_id`, `top_target_id`, and `url`; `target_id` is null for an in-process child frame, whose `session_id` and `frame_id` can be used with raw `cdp()`. A `page` definition executes its self-contained function in the registration document. A `cdp` definition runs in this Browser REPL with the normal helpers and persistent state. `/webmcp/invoke` executes CDP-backed tools independently of the registration document, so their handlers can navigate that tab and still return a result. Direct invocation through the page's native WebMCP API uses an isolated-world binding and remains subject to the page document's lifetime. CDP-backed `/webmcp/invoke` results over 240 KiB return an error rather than a truncated result.
+
+```js
+const [readTitle] = await webmcp.addCustomTools({
+  namespace: "example.com",
+  tools: [{
+    kind: "cdp",
+    match: {url_patterns: ["https://example.com/*"]},
+    tool: {
+      name: "read_title",
+      description: "Read the current page title.",
+      inputSchema: {type: "object", additionalProperties: false},
+      outputSchema: {
+        type: "object",
+        properties: {title: {type: "string"}},
+        required: ["title"],
+        additionalProperties: false,
+      },
+      annotations: {readOnlyHint: true},
+    },
+    execute: async (_input, {matches}) => ({
+      title: await js(() => document.title, {targetId: matches[0].top_target_id}),
+    }),
+  }],
+});
+```
+
+The registry validates MCP metadata with `ToolSchema` and compiles the required input schema and optional output schema with `AjvJsonSchemaValidator`. CDP-backed handlers validate output when an output schema is provided; page-backed handlers follow native imperative WebMCP result handling because Chromium does not currently accept `outputSchema`. Both packages are pinned image dependencies and may also be imported directly:
+
+```js
+var {ToolSchema} = await import("@modelcontextprotocol/core");
+var {AjvJsonSchemaValidator} = await import("@modelcontextprotocol/server/validators/ajv");
+```
+
+Removing a definition stops future discovery without canceling active invocations. Updating a tool requires removal followed by addition, which assigns a new ID and new live tool references. Registrations are continuously reconciled as frames are created, navigate, and detach. A graceful REPL reset removes registrations, clears the registry, and changes `repl_id`. After an abrupt process death, stale page registrations can remain visible until the next Browser REPL starts and performs its one-time empty-registry cleanup, or until their documents navigate; those stale registrations have no live handler and invocations time out.
 
 ## Patchright and Playwright Core
 

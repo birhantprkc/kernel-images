@@ -1,20 +1,23 @@
 // Persistent, unrestricted JavaScript daemon owned by the API process.
 
 import { AsyncLocalStorage } from 'async_hooks';
+import { randomUUID } from 'crypto';
 import { createServer, Socket } from 'net';
 import { StringDecoder } from 'string_decoder';
-import { unlinkSync, existsSync, promises as fsp } from 'fs';
+import { unlinkSync, existsSync, renameSync, writeFileSync, promises as fsp } from 'fs';
 import vm from 'vm';
 import util from 'util';
 import { BrowserReplCdpClient } from './browser-cdp-client';
 import { BrowserHelpers, buildBrowserGlobals } from './browser-helpers';
 import { formatBrowserReplHelp } from './browser-repl-help';
 import { CellRuntime } from './cell-runtime';
-import { createWebMCPClient } from './webmcp';
+import { CustomWebMCPRegistry } from './custom-webmcp';
+import { createWebMCPClient, WebMCPRequestError } from './webmcp';
 
 const SOCKET_PATH = process.env.BROWSER_REPL_SOCKET || '/tmp/browser-repl.sock';
 const REPL_ID = process.env.BROWSER_REPL_ID || 'unknown';
 const CDP_ENDPOINT = process.env.CDP_ENDPOINT || 'ws://127.0.0.1:9222';
+const CUSTOM_TOOLS_STATE_PATH = `${SOCKET_PATH}.custom-tools.json`;
 // Keep the endpoint discoverable by dynamically imported browser clients even
 // when the image relies on the runtime's default rather than an explicit env.
 process.env.CDP_ENDPOINT = CDP_ENDPOINT;
@@ -295,7 +298,7 @@ const consoleCapture = {
 const cdpClient = new BrowserReplCdpClient(CDP_ENDPOINT);
 const helpers = new BrowserHelpers(cdpClient);
 const webmcpExecution = new AsyncLocalStorage<AbortSignal>();
-const webmcp = createWebMCPClient({
+const webmcpClient = createWebMCPClient({
   apiBaseUrl: KERNEL_API_ENDPOINT,
   signalProvider: () => {
     const executionSignal = webmcpExecution.getStore();
@@ -311,6 +314,80 @@ const webmcp = createWebMCPClient({
     }
     return AbortSignal.any([executionSignal, AbortSignal.timeout(remainingMs)]);
   },
+});
+const publishCustomTools = (tools: ReturnType<CustomWebMCPRegistry['list']>) => {
+  const temporaryPath = `${CUSTOM_TOOLS_STATE_PATH}.${process.pid}.tmp`;
+  writeFileSync(temporaryPath, safeStringify({repl_id: REPL_ID, tools}), {mode: 0o600});
+  renameSync(temporaryPath, CUSTOM_TOOLS_STATE_PATH);
+};
+const customToolRegistry = new CustomWebMCPRegistry(
+  cdpClient,
+  (signal, callback) => webmcpExecution.run(signal, callback),
+  publishCustomTools,
+);
+publishCustomTools([]);
+customToolRegistry.setErrorHandler((message) => process.stderr.write(`[custom-webmcp] ${message}\n`));
+let nativeToolRefs = new Set<string>();
+const webmcp = Object.freeze({
+  ...webmcpClient,
+  async listTools(options: {excludeCustom?: boolean} = {}) {
+    const tools = await webmcpClient.listTools(options);
+    nativeToolRefs = new Set(tools.filter((tool) => !tool.source.custom || !customToolRegistry.isCDP(tool.source.custom.id))
+      .map((tool) => tool.tool_ref));
+    return tools;
+  },
+  async invokeTool(toolRef: string, input: Record<string, unknown> = {}, options: {timeoutSec?: number} = {}) {
+    if (nativeToolRefs.has(toolRef) || !customToolRegistry.hasCDP()) {
+      return webmcpClient.invokeTool(toolRef, input, options);
+    }
+    const tool = (await webmcpClient.listTools()).find((candidate) => candidate.tool_ref === toolRef);
+    if (!tool) throw new WebMCPRequestError(404, {message: 'WebMCP tool is no longer available; discover tools again'});
+    const id = tool.source.custom?.id;
+    if (!id || !customToolRegistry.isCDP(id)) {
+      nativeToolRefs.add(toolRef);
+      return webmcpClient.invokeTool(toolRef, input, options);
+    }
+    const targetId = tool.source.target_id;
+    if (!targetId) throw new WebMCPRequestError(404, {message: 'WebMCP tool is no longer available; discover tools again'});
+    const timeoutSec = options.timeoutSec ?? 60;
+    if (!Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > 120) {
+      throw new WebMCPRequestError(400, {message: 'timeout_sec must be between 1 and 120'});
+    }
+    const remainingMs = helpers.executionDeadlineMs === null
+      ? Infinity
+      : helpers.executionDeadlineMs - WEBMCP_DEADLINE_MARGIN_MS - Date.now();
+    if (remainingMs <= 0) throw new Error('WebMCP request exceeded the Browser REPL execution deadline');
+    const invocationId = randomUUID();
+    const controller = new AbortController();
+    const parentSignal = webmcpExecution.getStore();
+    const signal = parentSignal ? AbortSignal.any([parentSignal, controller.signal]) : controller.signal;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new WebMCPRequestError(504, {
+            code: 'outcome_unknown', invocation_id: invocationId,
+            message: 'the invocation started, but its final outcome could not be observed; do not retry automatically',
+          }));
+        }, Math.min(timeoutSec * 1000, remainingMs));
+      });
+      const output = await Promise.race([customToolRegistry.invokeCDP(id, targetId, input, signal), timeout]);
+      return {invocation_id: invocationId, status: 'completed' as const, output};
+    } catch (error) {
+      if (error instanceof WebMCPRequestError) throw error;
+      if (error instanceof Error && 'code' in error && error.code === 'custom_tool_not_found') {
+        throw new WebMCPRequestError(404, {message: 'WebMCP tool is no longer available; discover tools again'});
+      }
+      return {invocation_id: invocationId, status: 'error' as const, error_text: error instanceof Error ? error.message : String(error)};
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  },
+  addCustomTools: customToolRegistry.add,
+  listCustomTools: customToolRegistry.list,
+  removeCustomTool: customToolRegistry.remove,
+  invokeCustomCDPTool: customToolRegistry.invokeCDP,
 });
 const browserGlobals = buildBrowserGlobals(helpers);
 const browserNamespace = Object.freeze({
@@ -389,6 +466,7 @@ interface ExecuteResponse {
   repl_id: string;
   success: boolean;
   error?: string;
+  error_code?: string;
   stack?: string;
   content: ContentItem[];
   content_truncated: boolean;
@@ -438,10 +516,7 @@ async function executeRequest(
       }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
     });
-    const evaluation = webmcpExecution.run(
-      executionAbortController.signal,
-      () => evaluate(request.code),
-    );
+    const evaluation = webmcpExecution.run(executionAbortController.signal, () => evaluate(request.code));
     await Promise.race([evaluation, timeoutPromise]);
     return {
       id: request.id,
@@ -457,6 +532,7 @@ async function executeRequest(
       repl_id: REPL_ID,
       success: false,
       error: boundedProtocolText(err?.message ?? err, MAX_ERROR_BYTES),
+      error_code: typeof err?.code === 'string' ? boundedProtocolText(err.code, 128) : undefined,
       stack: typeof err?.stack === 'string' ? boundedProtocolText(err.stack, MAX_STACK_BYTES) : undefined,
       content: collector.items,
       content_truncated: collector.truncated,
@@ -693,8 +769,17 @@ function onUncaughtException(err: unknown): void {
   setTimeout(() => process.exit(1), 100).unref();
 }
 
-function shutdown(signal: string): void {
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   process.stderr.write(`[browser-repl] received ${signal}, shutting down (repl_id=${REPL_ID})\n`);
+  try {
+    await customToolRegistry.dispose();
+  } catch {
+    // The process is exiting; the next REPL also removes stale registrations.
+  }
   try {
     cdpClient.close();
   } catch {
@@ -719,8 +804,8 @@ async function main(): Promise<void> {
     // ignore
   }
 
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('unhandledRejection', onUnhandledRejection);
   process.on('uncaughtException', onUncaughtException);
 

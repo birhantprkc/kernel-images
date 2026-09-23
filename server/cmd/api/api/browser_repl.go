@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -74,10 +75,12 @@ type browserReplChild struct {
 // browserReplManager owns execution admission and the persistent Node child.
 // Lifecycle synchronization stays behind its Execute and Shutdown methods.
 type browserReplManager struct {
-	admission chan struct{}
-	lifecycle context.Context
-	stop      context.CancelCauseFunc
-	child     *browserReplChild // guarded by admission
+	admission         chan struct{}
+	lifecycle         context.Context
+	stop              context.CancelCauseFunc
+	child             *browserReplChild // guarded by admission
+	customToolsMu     sync.RWMutex
+	customToolsReplID string
 }
 
 func newBrowserReplManager() *browserReplManager {
@@ -89,6 +92,48 @@ func newBrowserReplManager() *browserReplManager {
 		lifecycle: lifecycle,
 		stop:      stop,
 	}
+}
+
+func (m *browserReplManager) setCustomToolsReplID(replID string) {
+	m.customToolsMu.Lock()
+	defer m.customToolsMu.Unlock()
+	m.customToolsReplID = replID
+}
+
+// The daemon's atomically published file is the sole discovery snapshot. A
+// missing or unreadable snapshot is an error, not permission to serve stale metadata.
+func (m *browserReplManager) customToolsSnapshot() (map[string]oapi.CustomWebMCPDefinition, error) {
+	m.customToolsMu.RLock()
+	defer m.customToolsMu.RUnlock()
+	if m.customToolsReplID == "" {
+		return make(map[string]oapi.CustomWebMCPDefinition), nil
+	}
+	data, err := os.ReadFile(browserReplCustomToolsPath())
+	if err != nil {
+		return nil, fmt.Errorf("read custom WebMCP discovery snapshot: %w", err)
+	}
+	var state struct {
+		ReplID string                        `json:"repl_id"`
+		Tools  []oapi.CustomWebMCPDefinition `json:"tools"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("decode custom WebMCP discovery snapshot: %w", err)
+	}
+	if state.ReplID != m.customToolsReplID {
+		return nil, fmt.Errorf("custom WebMCP discovery snapshot belongs to another REPL")
+	}
+	if state.Tools == nil {
+		return nil, fmt.Errorf("custom WebMCP discovery snapshot has no tools list")
+	}
+	tools := make(map[string]oapi.CustomWebMCPDefinition, len(state.Tools))
+	for _, tool := range state.Tools {
+		tools[tool.Id] = tool
+	}
+	return tools, nil
+}
+
+func browserReplCustomToolsPath() string {
+	return browserReplSocketPath() + ".custom-tools.json"
 }
 
 // browserReplSocketPath returns the Unix socket path for the REPL daemon.
@@ -206,6 +251,8 @@ func closedWaitChannel(err error) chan error {
 func (m *browserReplManager) clearLocked(ctx context.Context, child *browserReplChild) {
 	if m.child == child {
 		m.child = nil
+		m.setCustomToolsReplID("")
+		_ = os.Remove(browserReplCustomToolsPath())
 	}
 	removeBrowserReplSocket(logger.FromContext(ctx), browserReplSocketPath())
 }
@@ -253,6 +300,7 @@ func (m *browserReplManager) startLocked(ctx context.Context) error {
 		conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond)
 		if err == nil {
 			conn.Close()
+			m.setCustomToolsReplID(replID)
 			log.Info("browser REPL ready", "repl_id", replID)
 			return nil
 		}
@@ -359,6 +407,7 @@ type browserReplDaemonResponse struct {
 	ReplID           string            `json:"repl_id"`
 	Success          bool              `json:"success"`
 	Error            string            `json:"error,omitempty"`
+	ErrorCode        string            `json:"error_code,omitempty"`
 	Stack            *string           `json:"stack,omitempty"`
 	Content          []json.RawMessage `json:"content,omitempty"`
 	ContentTruncated bool              `json:"content_truncated"`
@@ -490,7 +539,6 @@ func (m *browserReplManager) executeLocked(ctx context.Context, request *browser
 	if resp.ReplID != child.id {
 		return nil, fmt.Errorf("response repl_id mismatch: expected %s, got %s", child.id, resp.ReplID)
 	}
-
 	return &resp, nil
 }
 
@@ -531,18 +579,30 @@ func browserReplTerminatedResponse(replID string, err error, durationMs int) oap
 }
 
 // StrictBrowserReplBodyMiddleware enforces additionalProperties: false on
-// POST /repl. The generated strict-server decoder silently drops
-// unknown fields, so without this middleware a request like
-// {"code":"1","bogus":1} would be accepted despite the published schema.
-// Malformed JSON and type errors are left to the strict handler's own 400
-// handling; only unknown fields are policed here.
+// Browser REPL-owned request bodies. The generated strict-server decoder
+// silently drops unknown fields, so malformed extensions need an explicit
+// check before dispatch.
 func StrictBrowserReplBodyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/repl" || r.Body == nil {
+		if r.Body == nil {
 			next.ServeHTTP(w, r)
 			return
 		}
-		limitedBody := http.MaxBytesReader(w, r.Body, maxBrowserReplBodyBytes)
+		var probe any
+		maxBytes := int64(0)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repl":
+			probe = &oapi.BrowserReplRequest{}
+			maxBytes = maxBrowserReplBodyBytes
+		case r.Method == http.MethodPost && r.URL.Path == "/webmcp/custom-tools":
+			probe = &oapi.AddCustomWebMCPToolsRequest{}
+			maxBytes = maxCustomWebMCPRequestBytes
+		default:
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		limitedBody := http.MaxBytesReader(w, r.Body, maxBytes)
 		body, err := io.ReadAll(limitedBody)
 		_ = r.Body.Close()
 		if err != nil {
@@ -551,7 +611,7 @@ func StrictBrowserReplBodyMiddleware(next http.Handler) http.Handler {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusRequestEntityTooLarge)
 				_ = json.NewEncoder(w).Encode(oapi.BadRequestError{
-					Message: fmt.Sprintf("request body exceeds %d bytes", maxBrowserReplBodyBytes),
+					Message: fmt.Sprintf("request body exceeds %d bytes", maxBytes),
 				})
 				return
 			}
@@ -562,8 +622,7 @@ func StrictBrowserReplBodyMiddleware(next http.Handler) http.Handler {
 
 		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.DisallowUnknownFields()
-		var probe oapi.BrowserReplRequest
-		if err := dec.Decode(&probe); err != nil && strings.HasPrefix(err.Error(), "json: unknown field") {
+		if err := dec.Decode(probe); err != nil && strings.HasPrefix(err.Error(), "json: unknown field") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(oapi.BadRequestError{
